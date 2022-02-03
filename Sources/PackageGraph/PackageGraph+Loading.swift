@@ -490,6 +490,66 @@ private func createResolvedPackages(
     return try packageBuilders.map{ try $0.construct() }
 }
 
+// Create a map between a package and module aliases specified for the targets in the package.
+// Assumes the param packageBuilders are ordered from upstream to downstream.
+private func gatherModuleAliases(from packageBuilders: [ResolvedPackageBuilder]) -> [String: [String: String]] {
+    // Map between a target name and a list of (module alias, package name) specified for the target
+    var targetNameToAliasAndPkgMap = [String: [(String, String)]]()
+
+    // Map between a package and its parent packages; used to keep track of module aliases that
+    // are specified downstream and need to be propagated up to the upstream modules
+    var pkgChainMap = [String: [String]]()
+    
+    // Iterate package builders in a reverse order, downstream (user) to upstream (library) and
+    // keep track of module aliases that need to be propagated to upstream modules
+    packageBuilders.reversed().forEach { builder in
+        let curPkg = builder.package.manifest.displayName
+        builder.package.targets.forEach { target in
+            if let parentPkgs = pkgChainMap[curPkg] {
+                // If a parent (downstream) package contains a module alias for this target
+                // from curPkg, add that alias and curPkg to the map
+                let elements = targetNameToAliasAndPkgMap.map { (targetName, aliasAndPkgList) -> [(String, String)] in
+                    if target.name == targetName {
+                        let tuples = aliasAndPkgList.filter { parentPkgs.contains($0.1) && !$0.0.isEmpty }
+                        return tuples.map { ($0.0, curPkg)}
+                    }
+                    return []
+                }.flatMap {$0}
+                targetNameToAliasAndPkgMap[target.name, default: []].append(contentsOf: elements)
+            }
+
+            target.dependencies.forEach { dep in
+                if case let .product(prodRef, _) = dep {
+                    if let prodPkg = prodRef.package {
+                        if let prodModuleAliases = prodRef.moduleAliases {
+                            for (depName, depAlias) in prodModuleAliases {
+                                // Add a module alias specified for this target's dependency
+                                targetNameToAliasAndPkgMap[depName, default: []].append((depAlias, prodPkg))
+                            }
+                        }
+                        // Also add the package hierarchy info
+                        pkgChainMap[prodPkg, default: []].append(curPkg)
+                    }
+                }
+            }
+        }
+    }
+    
+    var pkgToAliasesMap = [String: [String: String]]()
+    targetNameToAliasAndPkgMap.forEach { (keyName, aliasAndPkgList) in
+        // Reverse iterate the aliasAndPkgList so the module aliases specified at
+        // the most downstream are detected first
+        aliasAndPkgList.reversed().forEach { (elemAlias, elemPkg) in
+            // Add the most downstream module aliases to the tracking map
+            if pkgToAliasesMap[elemPkg]?[keyName] == nil, !elemAlias.isEmpty {
+                pkgToAliasesMap[elemPkg] = [keyName: elemAlias]
+            }
+        }
+    }
+    
+    return pkgToAliasesMap
+}
+
 /// A generic builder for `Resolved` models.
 private class ResolvedBuilder<T> {
     /// The constructed object, available after the first call to `construct()`.
